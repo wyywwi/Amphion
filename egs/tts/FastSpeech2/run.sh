@@ -4,26 +4,28 @@
 # LICENSE file in the root directory of this source tree.
 
 ######## Build Experiment Environment ###########
-exp_dir=$(cd `dirname $0`; pwd)
-work_dir=$(dirname $(dirname $(dirname $exp_dir)))
+exp_dir=$(cd `dirname $0`; pwd)                     # 获取当前脚本绝对路径 FastSpeech2
+work_dir=$(dirname $(dirname $(dirname $exp_dir)))  # .../Amphion/egs/tts/FastSpeech2/run.sh -> .../Amphion
 
 export WORK_DIR=$work_dir
 export PYTHONPATH=$work_dir
 export PYTHONIOENCODING=UTF-8
 
-cd $work_dir/modules/monotonic_align
+cd $work_dir/modules/monotonic_align    # modules/monotonic_align
 mkdir -p monotonic_align
-python setup.py build_ext --inplace
+python setup.py build_ext --inplace     # build_ext 编译 Cython 扩展模块: C++ 编写的 monotonic_align 模块（用于单调对齐搜索）
 cd $work_dir
 
-mfa_dir=$work_dir/pretrained/mfa
+mfa_dir=$work_dir/pretrained/mfa        # .../Amphion/pretrained/mfa
 echo $mfa_dir
 
 ######## Parse the Given Parameters from the Commond ###########
 # options=$(getopt -o c:n:s --long gpu:,config:,infer_expt_dir:,infer_output_dir:,infer_source_file:,infer_source_audio_dir:,infer_target_speaker:,infer_key_shift:,infer_vocoder_dir:,name:,stage: -- "$@")
-options=$(getopt -o c:n:s --long gpu:,config:,infer_expt_dir:,infer_output_dir:,infer_mode:,infer_dataset:,infer_testing_set:,infer_text:,name:,stage:,vocoder_dir: -- "$@")
+# 定义支持的参数
+options=$(getopt -o c:n:s --long gpu:,config:,infer_expt_dir:,infer_output_dir:,infer_mode:,infer_dataset:,infer_testing_set:,infer_text:,name:,stage:,vocoder_dir:,skip_existing: -- "$@")
 eval set -- "$options"
 
+# 循环取参数
 while true; do
   case $1 in
     # Experimental Configuration File
@@ -49,6 +51,8 @@ while true; do
     --infer_text) shift; infer_text=$1 ; shift ;;
     # [Only for Inference] The output dir to the vocoder. 
     --vocoder_dir) shift; vocoder_dir=$1 ; shift ;;
+    # [Only for Stage 1] Whether to skip completed preprocessing artifacts after strict checks.
+    --skip_existing) shift; skip_existing=$1 ; shift ;;
 
     --) shift ; break ;;
     *) echo "Invalid option: $1" exit 1 ;;
@@ -71,6 +75,10 @@ if [ -z "$gpu" ]; then
     gpu="0"
 fi
 
+if [ -z "$skip_existing" ]; then
+    skip_existing="true"
+fi
+
 ######## Features Extraction ###########
 if [ $running_stage -eq 1 ]; then
     if [ ! -d "$mfa_dir/montreal-forced-aligner" ]; then
@@ -79,7 +87,8 @@ if [ $running_stage -eq 1 ]; then
     CUDA_VISIBLE_DEVICES=$gpu python "${work_dir}"/bins/tts/preprocess.py \
         --config=$exp_config \
         --num_workers=4 \
-        --prepare_alignment=true
+        --prepare_alignment=true \
+        --skip_existing=$skip_existing
 fi
 
 ######## Training ###########

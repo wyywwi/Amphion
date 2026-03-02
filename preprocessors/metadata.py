@@ -20,10 +20,10 @@ def cal_metadata(cfg, dataset_types=["train", "test"]):
     print("Preparing metadata...")
     print("Including: \n{}\n".format("\n".join(datasets)))
 
-    datasets.sort()
+    datasets.sort() # sort by dataset name, alphabetically
 
     for dataset in tqdm(datasets):
-        save_dir = os.path.join(cfg.preprocess.processed_dir, dataset)
+        save_dir = os.path.join(cfg.preprocess.processed_dir, dataset) # default ./data/[dataset]
         assert os.path.exists(save_dir)
 
         # 'train.json' and 'test.json' and 'valid.json' of target dataset
@@ -32,8 +32,10 @@ def cal_metadata(cfg, dataset_types=["train", "test"]):
         all_utterances = list()
         duration = dict()
         total_duration = 0.0
+
+        # Only support one metadata list for each dataset, that [train/test] and [train/test/valid] cannot co-exist
         for dataset_type in dataset_types:
-            metadata = os.path.join(save_dir, "{}.json".format(dataset_type))
+            metadata = os.path.join(save_dir, "{}.json".format(dataset_type))   # default ./data/[dataset]/[dataset_type].json
 
             # Sort the metadata as the duration order
             with open(metadata, "r", encoding="utf-8") as f:

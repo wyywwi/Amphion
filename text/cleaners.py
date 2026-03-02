@@ -20,7 +20,7 @@ hyperparameter. Some cleaners are English-specific. You'll typically want to use
 
 # Regular expression matching whitespace:
 import re
-from unidecode import unidecode
+from unidecode import unidecode # convert non-english characters to english characters
 from .numbers import normalize_numbers
 
 _whitespace_re = re.compile(r"\s+")

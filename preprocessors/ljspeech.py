@@ -120,11 +120,60 @@ def split_dataset(
 max_wav_value = 32768.0
 
 
-def prepare_align(dataset, dataset_path, cfg, output_path):
+def _load_ljspeech_uids(dataset_path):
+    metadata_file = os.path.join(dataset_path, "metadata.csv")
+    uids = []
+    with open(metadata_file, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split("|")
+            if len(parts) == 0:
+                continue
+            uid = parts[0].strip()
+            if uid:
+                uids.append(uid)
+    return uids
+
+
+def is_alignment_complete(dataset, dataset_path, cfg, output_path):
+    speaker = "LJSpeech"
+    raw_speaker_dir = os.path.join(output_path, dataset, cfg.raw_data, speaker)
+    textgrid_speaker_dir = os.path.join(output_path, dataset, "TextGrid", speaker)
+
+    if not os.path.isdir(raw_speaker_dir) or not os.path.isdir(textgrid_speaker_dir):
+        return False
+
+    try:
+        uids = _load_ljspeech_uids(dataset_path)
+    except FileNotFoundError:
+        return False
+
+    if len(uids) == 0:
+        return False
+
+    for uid in uids:
+        wav_path = os.path.join(raw_speaker_dir, f"{uid}.wav")
+        lab_path = os.path.join(raw_speaker_dir, f"{uid}.lab")
+        textgrid_path = os.path.join(textgrid_speaker_dir, f"{uid}.TextGrid")
+        if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
+            return False
+        if not os.path.isfile(lab_path) or os.path.getsize(lab_path) == 0:
+            return False
+        if not os.path.isfile(textgrid_path) or os.path.getsize(textgrid_path) == 0:
+            return False
+    return True
+
+
+def prepare_align(dataset, dataset_path, cfg, output_path, skip_if_completed=False):
+    if skip_if_completed and is_alignment_complete(dataset, dataset_path, cfg, output_path):
+        print(
+            f"Alignment assets for {dataset} are complete. Skip re-running MFA alignment."
+        )
+        return
+
     in_dir = dataset_path
     out_dir = os.path.join(output_path, dataset, cfg.raw_data)
     sampling_rate = cfg.sample_rate
-    cleaners = cfg.text_cleaners
+    cleaners = cfg.text_cleaners # english_cleaners
     speaker = "LJSpeech"
     with open(os.path.join(dataset_path, "metadata.csv"), encoding="utf-8") as f:
         for line in tqdm(f):
@@ -143,7 +192,7 @@ def prepare_align(dataset, dataset_path, cfg, output_path):
             if os.path.exists(wav_path):
                 os.makedirs(os.path.join(out_dir, speaker), exist_ok=True)
                 wav, _ = librosa.load(wav_path, sampling_rate)
-                wav = wav / max(abs(wav)) * max_wav_value
+                wav = wav / max(abs(wav)) * max_wav_value   # normalize
 
                 wavfile.write(
                     os.path.join(out_dir, speaker, "{}.wav".format(base_name)),
@@ -213,6 +262,9 @@ def main(output_path, dataset_path, cfg):
         json.dump(res, f, indent=4, ensure_ascii=False)
 
     print("Test_hours= {}".format(hours))
+
+    # Fix: use the generated valid set instead of reusing the test set
+    res, hours = get_uid2utt(ljspeech_path, valid_set, cfg)
 
     # Save valid
     os.makedirs(save_dir, exist_ok=True)

@@ -37,9 +37,14 @@ def extract_acoustic_features(dataset, output_path, cfg, n_workers=1):
         with open(dataset_file, "r") as f:
             metadata.extend(json.load(f))
 
-    acoustic_extractor.extract_utt_acoustic_features_serial(
-        metadata, dataset_output, cfg
-    )
+    if n_workers is not None and n_workers > 1:
+        acoustic_extractor.extract_utt_acoustic_features_parallel(
+            metadata, dataset_output, cfg, n_workers=n_workers
+        )
+    else:
+        acoustic_extractor.extract_utt_acoustic_features_serial(
+            metadata, dataset_output, cfg
+        )
 
 
 def preprocess(cfg, args):

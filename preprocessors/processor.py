@@ -50,7 +50,7 @@ def preprocess_dataset(
                 "Custom dataset for {} task not implemented!".format(cfg.task_type)
             )
 
-    if re.match("opencpop*", dataset):
+    if dataset.startswith("opencpop"):
         opencpop.main(dataset, output_path, dataset_path)
     if dataset == "m4singer":
         m4singer.main(output_path, dataset_path)
@@ -98,7 +98,7 @@ def preprocess_dataset(
         hifitts.main(output_path, dataset_path)
 
 
-def prepare_align(dataset, dataset_path, cfg, output_path):
+def prepare_align(dataset, dataset_path, cfg, output_path, skip_if_completed=False):
     """Call specific function to handle specific dataset
 
     Args:
@@ -107,4 +107,10 @@ def prepare_align(dataset, dataset_path, cfg, output_path):
         output_path (str): path to store preprocessing result files
     """
     if dataset == "LJSpeech":
-        ljspeech.prepare_align(dataset, dataset_path, cfg, output_path)
+        ljspeech.prepare_align(
+            dataset,
+            dataset_path,
+            cfg,
+            output_path,
+            skip_if_completed=skip_if_completed,
+        )

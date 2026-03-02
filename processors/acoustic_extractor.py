@@ -4,6 +4,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import multiprocessing as mp
+import time
 import torch
 import numpy as np
 
@@ -12,8 +14,6 @@ from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 from utils.io import save_feature, save_txt, save_torch_audio
 from utils.util import has_existed
-from utils.tokenizer import extract_encodec_token
-from utils.stft import TacotronSTFT
 from utils.dsp import compress, audio_to_label
 from utils.data_utils import remove_outlier
 from preprocessors.metadata import replace_augment_name
@@ -21,10 +21,202 @@ from scipy.interpolate import interp1d
 from utils.mel import (
     extract_mel_features,
     extract_linear_features,
-    extract_mel_features_tts,
 )
 
 ZERO = 1e-12
+_PARALLEL_DATASET_OUTPUT = None
+_PARALLEL_CFG = None
+_PARALLEL_LOG_TIMING = False
+_TACOTRON_STFT_CACHE = {}
+_TIMING_KEYS = ("load_audio", "duration", "mel", "energy", "pitch", "save", "total")
+
+
+def _should_log_acoustic_timing(cfg):
+    return bool(getattr(cfg.preprocess, "log_acoustic_timing", True))
+
+
+def _new_timing():
+    return {k: 0.0 for k in _TIMING_KEYS}
+
+
+def _new_timing_stats():
+    return {k: [] for k in _TIMING_KEYS}
+
+
+def _collect_timing(stats, timing):
+    if stats is None or timing is None:
+        return
+    for k in _TIMING_KEYS:
+        if k in timing:
+            stats[k].append(float(timing[k]))
+
+
+def _print_timing_report(stats, mode, num_utts, wall_time):
+    if stats is None or num_utts == 0:
+        return
+    total_arr = np.asarray(stats["total"], dtype=np.float64)
+    if total_arr.size == 0:
+        return
+    p50_total = float(np.percentile(total_arr, 50))
+    p90_total = float(np.percentile(total_arr, 90))
+    avg_total = float(np.mean(total_arr))
+    print(
+        "[AcousticTiming] mode={} utts={} wall={:.2f}s avg_total={:.4f}s p50_total={:.4f}s p90_total={:.4f}s".format(
+            mode, num_utts, wall_time, avg_total, p50_total, p90_total
+        )
+    )
+
+    stage_keys = [k for k in _TIMING_KEYS if k != "total"]
+    stage_parts = []
+    for key in stage_keys:
+        arr = np.asarray(stats[key], dtype=np.float64)
+        if arr.size == 0:
+            continue
+        stage_parts.append(
+            "{}:avg={:.4f}s,p50={:.4f}s,p90={:.4f}s".format(
+                key,
+                float(np.mean(arr)),
+                float(np.percentile(arr, 50)),
+                float(np.percentile(arr, 90)),
+            )
+        )
+    if stage_parts:
+        print("[AcousticTiming][{}] {}".format(mode, " | ".join(stage_parts)))
+
+
+def _save_feature_with_timing(
+    dataset_output, feature_dir, uid, feature, timing=None, overrides=True
+):
+    t0 = time.perf_counter() if timing is not None else None
+    save_feature(dataset_output, feature_dir, uid, feature, overrides=overrides)
+    if timing is not None:
+        timing["save"] += time.perf_counter() - t0
+
+
+def _save_txt_with_timing(
+    dataset_output, feature_dir, uid, feature, timing=None, overrides=True
+):
+    t0 = time.perf_counter() if timing is not None else None
+    save_txt(dataset_output, feature_dir, uid, feature, overrides=overrides)
+    if timing is not None:
+        timing["save"] += time.perf_counter() - t0
+
+
+def _save_torch_audio_with_timing(
+    dataset_output, feature_dir, uid, wav_torch, fs, timing=None, overrides=True
+):
+    t0 = time.perf_counter() if timing is not None else None
+    save_torch_audio(
+        dataset_output, feature_dir, uid, wav_torch, fs, overrides=overrides
+    )
+    if timing is not None:
+        timing["save"] += time.perf_counter() - t0
+
+
+def _get_cached_tacotron_stft(cfg_preprocess, device_key):
+    from utils.stft import TacotronSTFT
+
+    cache_key = (
+        int(cfg_preprocess.sample_rate),
+        int(cfg_preprocess.win_size),
+        int(cfg_preprocess.hop_size),
+        int(cfg_preprocess.n_fft),
+        int(cfg_preprocess.n_mel),
+        float(cfg_preprocess.fmin),
+        float(cfg_preprocess.fmax),
+        str(device_key),
+    )
+    stft = _TACOTRON_STFT_CACHE.get(cache_key)
+    if stft is None:
+        stft = TacotronSTFT(
+            sampling_rate=cfg_preprocess.sample_rate,
+            win_length=cfg_preprocess.win_size,
+            hop_length=cfg_preprocess.hop_size,
+            filter_length=cfg_preprocess.n_fft,
+            n_mel_channels=cfg_preprocess.n_mel,
+            mel_fmin=cfg_preprocess.fmin,
+            mel_fmax=cfg_preprocess.fmax,
+        )
+        _TACOTRON_STFT_CACHE[cache_key] = stft
+    return stft
+
+
+def _extract_taco_mel_energy(wav_torch, _stft):
+    audio = torch.clip(wav_torch.unsqueeze(0), -1, 1)
+    audio = torch.autograd.Variable(audio, requires_grad=False)
+    mel, energy = _stft.mel_spectrogram(audio)
+    mel = torch.squeeze(mel, 0)
+    energy = torch.squeeze(energy, 0).cpu().numpy().astype(np.float32)
+    return mel, energy
+
+
+def _is_gpu_heavy_acoustic_path(cfg):
+    reasons = []
+    if bool(getattr(cfg.preprocess, "extract_mel", False)) and getattr(
+        cfg.preprocess, "mel_extract_mode", None
+    ) == "taco":
+        reasons.append("mel_extract_mode=taco")
+
+    if bool(getattr(cfg.preprocess, "extract_energy", False)) and getattr(
+        cfg.preprocess, "energy_extract_mode", None
+    ) == "from_tacotron_stft":
+        reasons.append("energy_extract_mode=from_tacotron_stft")
+
+    if bool(getattr(cfg.preprocess, "extract_acoustic_token", False)):
+        reasons.append("extract_acoustic_token=true")
+
+    return reasons
+
+
+def _is_gpu_batch_mel_energy_enabled(cfg):
+    return bool(getattr(cfg.preprocess, "gpu_batch_mel_energy", False))
+
+
+def _dispatch_extract_utt_acoustic_features(
+    dataset_output, cfg, utt, return_timing=False
+):
+    if cfg.task_type == "tts":
+        return extract_utt_acoustic_features_tts(
+            dataset_output, cfg, utt, return_timing=return_timing
+        )
+    if cfg.task_type == "svc":
+        return extract_utt_acoustic_features_svc(
+            dataset_output, cfg, utt, return_timing=return_timing
+        )
+    if cfg.task_type == "vocoder":
+        return extract_utt_acoustic_features_vocoder(
+            dataset_output, cfg, utt, return_timing=return_timing
+        )
+    if cfg.task_type == "tta":
+        return extract_utt_acoustic_features_tta(
+            dataset_output, cfg, utt, return_timing=return_timing
+        )
+    return None
+
+
+def _init_parallel_acoustic_worker(dataset_output, cfg, log_timing=False):
+    global _PARALLEL_DATASET_OUTPUT, _PARALLEL_CFG, _PARALLEL_LOG_TIMING
+    _PARALLEL_DATASET_OUTPUT = dataset_output
+    _PARALLEL_CFG = cfg
+    _PARALLEL_LOG_TIMING = bool(log_timing)
+
+
+def _parallel_extract_worker(utt):
+    if _PARALLEL_DATASET_OUTPUT is None or _PARALLEL_CFG is None:
+        raise RuntimeError("Parallel acoustic worker is not initialized correctly.")
+    uid = utt.get("Uid", "<unknown>")
+    try:
+        timing = _dispatch_extract_utt_acoustic_features(
+            _PARALLEL_DATASET_OUTPUT,
+            _PARALLEL_CFG,
+            utt,
+            return_timing=_PARALLEL_LOG_TIMING,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to extract acoustic features for utterance {uid}"
+        ) from exc
+    return {"uid": uid, "timing": timing}
 
 
 def extract_utt_acoustic_features_parallel(metadata, dataset_output, cfg, n_workers=1):
@@ -39,15 +231,62 @@ def extract_utt_acoustic_features_parallel(metadata, dataset_output, cfg, n_work
     Returns:
         list: acoustic features
     """
-    for utt in tqdm(metadata):
-        if cfg.task_type == "tts":
-            extract_utt_acoustic_features_tts(dataset_output, cfg, utt)
-        if cfg.task_type == "svc":
-            extract_utt_acoustic_features_svc(dataset_output, cfg, utt)
-        if cfg.task_type == "vocoder":
-            extract_utt_acoustic_features_vocoder(dataset_output, cfg, utt)
-        if cfg.task_type == "tta":
-            extract_utt_acoustic_features_tta(dataset_output, cfg, utt)
+    num_utts = len(metadata)
+    if num_utts == 0:
+        return
+    if _is_gpu_batch_mel_energy_enabled(cfg):
+        print(
+            "[AcousticExtractor] preprocess.gpu_batch_mel_energy=true is currently disabled in stage 1 mainline path; using per-utterance extraction."
+        )
+
+    try:
+        workers = int(n_workers)
+    except (TypeError, ValueError):
+        workers = 1
+    requested_workers = max(1, workers)
+    workers = max(1, min(workers, num_utts))
+
+    forced_serial_reasons = _is_gpu_heavy_acoustic_path(cfg)
+    if workers > 1 and forced_serial_reasons:
+        print(
+            "[AcousticExtractor] Requested {} workers but auto-switched to serial (1 worker). reason: {}".format(
+                requested_workers, ", ".join(forced_serial_reasons)
+            )
+        )
+        workers = 1
+
+    if workers <= 1:
+        extract_utt_acoustic_features_serial(metadata, dataset_output, cfg)
+        return
+
+    log_timing = _should_log_acoustic_timing(cfg)
+    timing_stats = _new_timing_stats() if log_timing else None
+    chunksize = max(1, num_utts // (workers * 8))
+    wall_start = time.perf_counter()
+
+    # Use spawn so CUDA-dependent branches (e.g., EnCodec token extraction)
+    # can run safely in subprocesses.
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        processes=workers,
+        initializer=_init_parallel_acoustic_worker,
+        initargs=(dataset_output, cfg, log_timing),
+    ) as pool:
+        for result in tqdm(
+            pool.imap_unordered(_parallel_extract_worker, metadata, chunksize=chunksize),
+            total=num_utts,
+        ):
+            pass
+            if log_timing:
+                _collect_timing(timing_stats, result.get("timing"))
+
+    if log_timing:
+        _print_timing_report(
+            timing_stats,
+            mode="parallel(workers={})".format(workers),
+            num_utts=num_utts,
+            wall_time=time.perf_counter() - wall_start,
+        )
 
 
 def avg_phone_feature(feature, duration, interpolation=False):
@@ -83,18 +322,34 @@ def extract_utt_acoustic_features_serial(metadata, dataset_output, cfg):
         cfg (dict): dictionary that stores configurations
 
     """
+    num_utts = len(metadata)
+    if num_utts == 0:
+        return
+    if _is_gpu_batch_mel_energy_enabled(cfg):
+        print(
+            "[AcousticExtractor] preprocess.gpu_batch_mel_energy=true is currently disabled in stage 1 mainline path; using per-utterance extraction."
+        )
+
+    log_timing = _should_log_acoustic_timing(cfg)
+    timing_stats = _new_timing_stats() if log_timing else None
+    wall_start = time.perf_counter()
     for utt in tqdm(metadata):
-        if cfg.task_type == "tts":
-            extract_utt_acoustic_features_tts(dataset_output, cfg, utt)
-        if cfg.task_type == "svc":
-            extract_utt_acoustic_features_svc(dataset_output, cfg, utt)
-        if cfg.task_type == "vocoder":
-            extract_utt_acoustic_features_vocoder(dataset_output, cfg, utt)
-        if cfg.task_type == "tta":
-            extract_utt_acoustic_features_tta(dataset_output, cfg, utt)
+        timing = _dispatch_extract_utt_acoustic_features(
+            dataset_output, cfg, utt, return_timing=log_timing
+        )
+        if log_timing:
+            _collect_timing(timing_stats, timing)
+
+    if log_timing:
+        _print_timing_report(
+            timing_stats,
+            mode="serial",
+            num_utts=num_utts,
+            wall_time=time.perf_counter() - wall_start,
+        )
 
 
-def __extract_utt_acoustic_features(dataset_output, cfg, utt):
+def __extract_utt_acoustic_features(dataset_output, cfg, utt, return_timing=False):
     """Extract acoustic features from utterances (in single process)
 
     Args:
@@ -104,8 +359,10 @@ def __extract_utt_acoustic_features(dataset_output, cfg, utt):
                     path to utternace, duration, utternace index
 
     """
-    from utils import audio, f0, world, duration
+    from utils import audio, f0, duration
 
+    timing = _new_timing() if return_timing else None
+    utt_start = time.perf_counter() if timing is not None else None
     uid = utt["Uid"]
     wav_path = utt["Path"]
     if os.path.exists(os.path.join(dataset_output, cfg.preprocess.raw_data)):
@@ -114,115 +371,185 @@ def __extract_utt_acoustic_features(dataset_output, cfg, utt):
         )
 
     with torch.no_grad():
+        durations = None
+
         # Load audio data into tensor with sample rate of the config file
+        t0 = time.perf_counter() if timing is not None else None
         wav_torch, _ = audio.load_audio_torch(wav_path, cfg.preprocess.sample_rate)
+        if timing is not None:
+            timing["load_audio"] += time.perf_counter() - t0
         wav = wav_torch.cpu().numpy()
 
         # extract features
         if cfg.preprocess.extract_duration:
+            t0 = time.perf_counter() if timing is not None else None
             durations, phones, start, end = duration.get_duration(
                 utt, wav, cfg.preprocess
             )
-            save_feature(dataset_output, cfg.preprocess.duration_dir, uid, durations)
-            save_txt(dataset_output, cfg.preprocess.lab_dir, uid, phones)
+            if timing is not None:
+                timing["duration"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.duration_dir, uid, durations, timing
+            )
+            _save_txt_with_timing(dataset_output, cfg.preprocess.lab_dir, uid, phones, timing)
             wav = wav[start:end].astype(np.float32)
             wav_torch = torch.from_numpy(wav).to(wav_torch.device)
 
+        use_taco_mel = (
+            cfg.preprocess.extract_mel and cfg.preprocess.mel_extract_mode == "taco"
+        )
+        use_taco_energy = (
+            cfg.preprocess.extract_energy
+            and cfg.preprocess.energy_extract_mode == "from_tacotron_stft"
+        )
+        taco_mel = None
+        taco_energy = None
+        if use_taco_mel or use_taco_energy:
+            _stft = _get_cached_tacotron_stft(cfg.preprocess, wav_torch.device)
+            t0 = time.perf_counter() if timing is not None else None
+            taco_mel, taco_energy = _extract_taco_mel_energy(wav_torch, _stft)
+            if timing is not None:
+                elapsed = time.perf_counter() - t0
+                if use_taco_mel and use_taco_energy:
+                    timing["mel"] += elapsed * 0.5
+                    timing["energy"] += elapsed * 0.5
+                elif use_taco_mel:
+                    timing["mel"] += elapsed
+                else:
+                    timing["energy"] += elapsed
+
         if cfg.preprocess.extract_linear_spec:
+            t0 = time.perf_counter() if timing is not None else None
             linear = extract_linear_features(wav_torch.unsqueeze(0), cfg.preprocess)
-            save_feature(
-                dataset_output, cfg.preprocess.linear_dir, uid, linear.cpu().numpy()
+            if timing is not None:
+                timing["mel"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.linear_dir, uid, linear.cpu().numpy(), timing
             )
 
         if cfg.preprocess.extract_mel:
-            if cfg.preprocess.mel_extract_mode == "taco":
-                _stft = TacotronSTFT(
-                    sampling_rate=cfg.preprocess.sample_rate,
-                    win_length=cfg.preprocess.win_size,
-                    hop_length=cfg.preprocess.hop_size,
-                    filter_length=cfg.preprocess.n_fft,
-                    n_mel_channels=cfg.preprocess.n_mel,
-                    mel_fmin=cfg.preprocess.fmin,
-                    mel_fmax=cfg.preprocess.fmax,
-                )
-                mel = extract_mel_features(
-                    wav_torch.unsqueeze(0), cfg.preprocess, taco=True, _stft=_stft
-                )
-                if cfg.preprocess.extract_duration:
-                    mel = mel[:, : sum(durations)]
+            if use_taco_mel:
+                mel = taco_mel
             else:
+                t0 = time.perf_counter() if timing is not None else None
                 mel = extract_mel_features(wav_torch.unsqueeze(0), cfg.preprocess)
-            save_feature(dataset_output, cfg.preprocess.mel_dir, uid, mel.cpu().numpy())
+                if timing is not None:
+                    timing["mel"] += time.perf_counter() - t0
+            if cfg.preprocess.extract_duration:
+                mel = mel[:, : sum(durations)]
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.mel_dir, uid, mel.cpu().numpy(), timing
+            )
 
         if cfg.preprocess.extract_energy:
             if (
                 cfg.preprocess.energy_extract_mode == "from_mel"
                 and cfg.preprocess.extract_mel
             ):
+                t0 = time.perf_counter() if timing is not None else None
                 energy = (mel.exp() ** 2).sum(0).sqrt().cpu().numpy()
+                if timing is not None:
+                    timing["energy"] += time.perf_counter() - t0
             elif cfg.preprocess.energy_extract_mode == "from_waveform":
+                t0 = time.perf_counter() if timing is not None else None
                 energy = audio.energy(wav, cfg.preprocess)
+                if timing is not None:
+                    timing["energy"] += time.perf_counter() - t0
             elif cfg.preprocess.energy_extract_mode == "from_tacotron_stft":
-                _stft = TacotronSTFT(
-                    sampling_rate=cfg.preprocess.sample_rate,
-                    win_length=cfg.preprocess.win_size,
-                    hop_length=cfg.preprocess.hop_size,
-                    filter_length=cfg.preprocess.n_fft,
-                    n_mel_channels=cfg.preprocess.n_mel,
-                    mel_fmin=cfg.preprocess.fmin,
-                    mel_fmax=cfg.preprocess.fmax,
-                )
-                _, energy = audio.get_energy_from_tacotron(wav, _stft)
+                energy = taco_energy
             else:
                 assert cfg.preprocess.energy_extract_mode in [
                     "from_mel",
                     "from_waveform",
                     "from_tacotron_stft",
                 ], f"{cfg.preprocess.energy_extract_mode} not in supported energy_extract_mode [from_mel, from_waveform, from_tacotron_stft]"
+
+            if (
+                cfg.preprocess.extract_duration
+                and use_taco_mel
+                and use_taco_energy
+                and cfg.preprocess.extract_mel
+            ):
+                expected_len = sum(durations)
+                assert mel.shape[1] >= expected_len and len(energy) >= expected_len, (
+                    f"duration and taco mel/energy mismatch for {uid}: "
+                    f"duration_sum={expected_len}, mel_frames={mel.shape[1]}, energy_frames={len(energy)}"
+                )
+
             if cfg.preprocess.extract_duration:
                 energy = energy[: sum(durations)]
                 phone_energy = avg_phone_feature(energy, durations)
-                save_feature(
-                    dataset_output, cfg.preprocess.phone_energy_dir, uid, phone_energy
+                _save_feature_with_timing(
+                    dataset_output,
+                    cfg.preprocess.phone_energy_dir,
+                    uid,
+                    phone_energy,
+                    timing,
                 )
 
-            save_feature(dataset_output, cfg.preprocess.energy_dir, uid, energy)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.energy_dir, uid, energy, timing
+            )
 
         if cfg.preprocess.extract_pitch:
+            t0 = time.perf_counter() if timing is not None else None
             pitch = f0.get_f0(wav, cfg.preprocess)
             if cfg.preprocess.extract_duration:
                 pitch = pitch[: sum(durations)]
                 phone_pitch = avg_phone_feature(pitch, durations, interpolation=True)
-                save_feature(
-                    dataset_output, cfg.preprocess.phone_pitch_dir, uid, phone_pitch
+                _save_feature_with_timing(
+                    dataset_output,
+                    cfg.preprocess.phone_pitch_dir,
+                    uid,
+                    phone_pitch,
+                    timing,
                 )
-            save_feature(dataset_output, cfg.preprocess.pitch_dir, uid, pitch)
+            if timing is not None:
+                timing["pitch"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.pitch_dir, uid, pitch, timing
+            )
 
             if cfg.preprocess.extract_uv:
                 assert isinstance(pitch, np.ndarray)
                 uv = pitch != 0
-                save_feature(dataset_output, cfg.preprocess.uv_dir, uid, uv)
+                _save_feature_with_timing(
+                    dataset_output, cfg.preprocess.uv_dir, uid, uv, timing
+                )
 
         if cfg.preprocess.extract_audio:
-            save_feature(dataset_output, cfg.preprocess.audio_dir, uid, wav)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.audio_dir, uid, wav, timing
+            )
 
         if cfg.preprocess.extract_label:
             if cfg.preprocess.is_mu_law:
                 # compress audio
                 wav = compress(wav, cfg.preprocess.bits)
             label = audio_to_label(wav, cfg.preprocess.bits)
-            save_feature(dataset_output, cfg.preprocess.label_dir, uid, label)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.label_dir, uid, label, timing
+            )
 
         if cfg.preprocess.extract_acoustic_token:
             if cfg.preprocess.acoustic_token_extractor == "Encodec":
+                from utils.tokenizer import extract_encodec_token
+
                 codes = extract_encodec_token(wav_path)
-                save_feature(
-                    dataset_output, cfg.preprocess.acoustic_token_dir, uid, codes
+                _save_feature_with_timing(
+                    dataset_output, cfg.preprocess.acoustic_token_dir, uid, codes, timing
                 )
+
+    if timing is not None:
+        timing["total"] = time.perf_counter() - utt_start
+        return timing
+    return None
 
 
 # TODO: refactor extract_utt_acoustic_features_task function due to many duplicated code
-def extract_utt_acoustic_features_tts(dataset_output, cfg, utt):
+def extract_utt_acoustic_features_tts(
+    dataset_output, cfg, utt, return_timing=False
+):
     """Extract acoustic features from utterances (in single process)
 
     Args:
@@ -232,8 +559,10 @@ def extract_utt_acoustic_features_tts(dataset_output, cfg, utt):
                     path to utternace, duration, utternace index
 
     """
-    from utils import audio, f0, world, duration
+    from utils import audio, f0, duration
 
+    timing = _new_timing() if return_timing else None
+    utt_start = time.perf_counter() if timing is not None else None
     uid = utt["Uid"]
     wav_path = utt["Path"]
     if os.path.exists(os.path.join(dataset_output, cfg.preprocess.raw_data)):
@@ -248,106 +577,163 @@ def extract_utt_acoustic_features_tts(dataset_output, cfg, utt):
         assert os.path.exists(wav_path)
 
     with torch.no_grad():
+        durations = None
+
         # Load audio data into tensor with sample rate of the config file
+        t0 = time.perf_counter() if timing is not None else None
         wav_torch, _ = audio.load_audio_torch(wav_path, cfg.preprocess.sample_rate)
+        if timing is not None:
+            timing["load_audio"] += time.perf_counter() - t0
         wav = wav_torch.cpu().numpy()
 
         # extract features
         if cfg.preprocess.extract_duration:
+            t0 = time.perf_counter() if timing is not None else None
             durations, phones, start, end = duration.get_duration(
                 utt, wav, cfg.preprocess
             )
-            save_feature(dataset_output, cfg.preprocess.duration_dir, uid, durations)
-            save_txt(dataset_output, cfg.preprocess.lab_dir, uid, phones)
+            if timing is not None:
+                timing["duration"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.duration_dir, uid, durations, timing
+            )
+            _save_txt_with_timing(dataset_output, cfg.preprocess.lab_dir, uid, phones, timing)
             wav = wav[start:end].astype(np.float32)
             wav_torch = torch.from_numpy(wav).to(wav_torch.device)
+
+        use_taco_mel = (
+            cfg.preprocess.extract_mel and cfg.preprocess.mel_extract_mode == "taco"
+        )
+        use_taco_energy = (
+            cfg.preprocess.extract_energy
+            and cfg.preprocess.energy_extract_mode == "from_tacotron_stft"
+        )
+        taco_mel = None
+        taco_energy = None
+        if use_taco_mel or use_taco_energy:
+            _stft = _get_cached_tacotron_stft(cfg.preprocess, wav_torch.device)
+            t0 = time.perf_counter() if timing is not None else None
+            taco_mel, taco_energy = _extract_taco_mel_energy(wav_torch, _stft)
+            if timing is not None:
+                elapsed = time.perf_counter() - t0
+                if use_taco_mel and use_taco_energy:
+                    timing["mel"] += elapsed * 0.5
+                    timing["energy"] += elapsed * 0.5
+                elif use_taco_mel:
+                    timing["mel"] += elapsed
+                else:
+                    timing["energy"] += elapsed
 
         if cfg.preprocess.extract_linear_spec:
             from utils.mel import extract_linear_features
 
+            t0 = time.perf_counter() if timing is not None else None
             linear = extract_linear_features(wav_torch.unsqueeze(0), cfg.preprocess)
-            save_feature(
-                dataset_output, cfg.preprocess.linear_dir, uid, linear.cpu().numpy()
+            if timing is not None:
+                timing["mel"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.linear_dir, uid, linear.cpu().numpy(), timing
             )
 
         if cfg.preprocess.extract_mel:
             from utils.mel import extract_mel_features
 
-            if cfg.preprocess.mel_extract_mode == "taco":
-                _stft = TacotronSTFT(
-                    sampling_rate=cfg.preprocess.sample_rate,
-                    win_length=cfg.preprocess.win_size,
-                    hop_length=cfg.preprocess.hop_size,
-                    filter_length=cfg.preprocess.n_fft,
-                    n_mel_channels=cfg.preprocess.n_mel,
-                    mel_fmin=cfg.preprocess.fmin,
-                    mel_fmax=cfg.preprocess.fmax,
-                )
-                mel = extract_mel_features_tts(
-                    wav_torch.unsqueeze(0), cfg.preprocess, taco=True, _stft=_stft
-                )
-                if cfg.preprocess.extract_duration:
-                    mel = mel[:, : sum(durations)]
+            if use_taco_mel:
+                mel = taco_mel
             else:
+                t0 = time.perf_counter() if timing is not None else None
                 mel = extract_mel_features(wav_torch.unsqueeze(0), cfg.preprocess)
-            save_feature(dataset_output, cfg.preprocess.mel_dir, uid, mel.cpu().numpy())
+                if timing is not None:
+                    timing["mel"] += time.perf_counter() - t0
+            if cfg.preprocess.extract_duration:
+                mel = mel[:, : sum(durations)]
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.mel_dir, uid, mel.cpu().numpy(), timing
+            )
 
         if cfg.preprocess.extract_energy:
             if (
                 cfg.preprocess.energy_extract_mode == "from_mel"
                 and cfg.preprocess.extract_mel
             ):
+                t0 = time.perf_counter() if timing is not None else None
                 energy = (mel.exp() ** 2).sum(0).sqrt().cpu().numpy()
+                if timing is not None:
+                    timing["energy"] += time.perf_counter() - t0
             elif cfg.preprocess.energy_extract_mode == "from_waveform":
+                t0 = time.perf_counter() if timing is not None else None
                 energy = audio.energy(wav, cfg.preprocess)
+                if timing is not None:
+                    timing["energy"] += time.perf_counter() - t0
             elif cfg.preprocess.energy_extract_mode == "from_tacotron_stft":
-                _stft = TacotronSTFT(
-                    sampling_rate=cfg.preprocess.sample_rate,
-                    win_length=cfg.preprocess.win_size,
-                    hop_length=cfg.preprocess.hop_size,
-                    filter_length=cfg.preprocess.n_fft,
-                    n_mel_channels=cfg.preprocess.n_mel,
-                    mel_fmin=cfg.preprocess.fmin,
-                    mel_fmax=cfg.preprocess.fmax,
-                )
-                _, energy = audio.get_energy_from_tacotron(wav, _stft)
+                energy = taco_energy
             else:
                 assert cfg.preprocess.energy_extract_mode in [
                     "from_mel",
                     "from_waveform",
                     "from_tacotron_stft",
                 ], f"{cfg.preprocess.energy_extract_mode} not in supported energy_extract_mode [from_mel, from_waveform, from_tacotron_stft]"
+
+            if (
+                cfg.preprocess.extract_duration
+                and use_taco_mel
+                and use_taco_energy
+                and cfg.preprocess.extract_mel
+            ):
+                expected_len = sum(durations)
+                assert mel.shape[1] >= expected_len and len(energy) >= expected_len, (
+                    f"duration and taco mel/energy mismatch for {uid}: "
+                    f"duration_sum={expected_len}, mel_frames={mel.shape[1]}, energy_frames={len(energy)}"
+                )
             if cfg.preprocess.extract_duration:
                 energy = energy[: sum(durations)]
                 phone_energy = avg_phone_feature(energy, durations)
-                save_feature(
-                    dataset_output, cfg.preprocess.phone_energy_dir, uid, phone_energy
+                _save_feature_with_timing(
+                    dataset_output,
+                    cfg.preprocess.phone_energy_dir,
+                    uid,
+                    phone_energy,
+                    timing,
                 )
 
-            save_feature(dataset_output, cfg.preprocess.energy_dir, uid, energy)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.energy_dir, uid, energy, timing
+            )
 
         if cfg.preprocess.extract_pitch:
+            t0 = time.perf_counter() if timing is not None else None
             pitch = f0.get_f0(wav, cfg.preprocess)
             if cfg.preprocess.extract_duration:
                 pitch = pitch[: sum(durations)]
                 phone_pitch = avg_phone_feature(pitch, durations, interpolation=True)
-                save_feature(
-                    dataset_output, cfg.preprocess.phone_pitch_dir, uid, phone_pitch
+                _save_feature_with_timing(
+                    dataset_output,
+                    cfg.preprocess.phone_pitch_dir,
+                    uid,
+                    phone_pitch,
+                    timing,
                 )
-            save_feature(dataset_output, cfg.preprocess.pitch_dir, uid, pitch)
+            if timing is not None:
+                timing["pitch"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.pitch_dir, uid, pitch, timing
+            )
 
             if cfg.preprocess.extract_uv:
                 assert isinstance(pitch, np.ndarray)
                 uv = pitch != 0
-                save_feature(dataset_output, cfg.preprocess.uv_dir, uid, uv)
+                _save_feature_with_timing(
+                    dataset_output, cfg.preprocess.uv_dir, uid, uv, timing
+                )
 
         if cfg.preprocess.extract_audio:
-            save_torch_audio(
+            _save_torch_audio_with_timing(
                 dataset_output,
                 cfg.preprocess.audio_dir,
                 uid,
                 wav_torch,
                 cfg.preprocess.sample_rate,
+                timing=timing,
             )
 
         if cfg.preprocess.extract_label:
@@ -355,25 +741,40 @@ def extract_utt_acoustic_features_tts(dataset_output, cfg, utt):
                 # compress audio
                 wav = compress(wav, cfg.preprocess.bits)
             label = audio_to_label(wav, cfg.preprocess.bits)
-            save_feature(dataset_output, cfg.preprocess.label_dir, uid, label)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.label_dir, uid, label, timing
+            )
 
         if cfg.preprocess.extract_acoustic_token:
             if cfg.preprocess.acoustic_token_extractor == "Encodec":
+                from utils.tokenizer import extract_encodec_token
+
                 codes = extract_encodec_token(wav_path)
-                save_feature(
-                    dataset_output, cfg.preprocess.acoustic_token_dir, uid, codes
+                _save_feature_with_timing(
+                    dataset_output, cfg.preprocess.acoustic_token_dir, uid, codes, timing
                 )
 
-
-def extract_utt_acoustic_features_svc(dataset_output, cfg, utt):
-    __extract_utt_acoustic_features(dataset_output, cfg, utt)
-
-
-def extract_utt_acoustic_features_tta(dataset_output, cfg, utt):
-    __extract_utt_acoustic_features(dataset_output, cfg, utt)
+    if timing is not None:
+        timing["total"] = time.perf_counter() - utt_start
+        return timing
+    return None
 
 
-def extract_utt_acoustic_features_vocoder(dataset_output, cfg, utt):
+def extract_utt_acoustic_features_svc(dataset_output, cfg, utt, return_timing=False):
+    return __extract_utt_acoustic_features(
+        dataset_output, cfg, utt, return_timing=return_timing
+    )
+
+
+def extract_utt_acoustic_features_tta(dataset_output, cfg, utt, return_timing=False):
+    return __extract_utt_acoustic_features(
+        dataset_output, cfg, utt, return_timing=return_timing
+    )
+
+
+def extract_utt_acoustic_features_vocoder(
+    dataset_output, cfg, utt, return_timing=False
+):
     """Extract acoustic features from utterances (in single process)
 
     Args:
@@ -383,47 +784,72 @@ def extract_utt_acoustic_features_vocoder(dataset_output, cfg, utt):
                     path to utternace, duration, utternace index
 
     """
-    from utils import audio, f0, world, duration
+    from utils import audio, f0
 
+    timing = _new_timing() if return_timing else None
+    utt_start = time.perf_counter() if timing is not None else None
     uid = utt["Uid"]
     wav_path = utt["Path"]
 
     with torch.no_grad():
         # Load audio data into tensor with sample rate of the config file
+        t0 = time.perf_counter() if timing is not None else None
         wav_torch, _ = audio.load_audio_torch(wav_path, cfg.preprocess.sample_rate)
+        if timing is not None:
+            timing["load_audio"] += time.perf_counter() - t0
         wav = wav_torch.cpu().numpy()
 
         # extract features
         if cfg.preprocess.extract_mel:
             from utils.mel import extract_mel_features
 
+            t0 = time.perf_counter() if timing is not None else None
             mel = extract_mel_features(wav_torch.unsqueeze(0), cfg.preprocess)
-            save_feature(dataset_output, cfg.preprocess.mel_dir, uid, mel.cpu().numpy())
+            if timing is not None:
+                timing["mel"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.mel_dir, uid, mel.cpu().numpy(), timing
+            )
 
         if cfg.preprocess.extract_energy:
             if (
                 cfg.preprocess.energy_extract_mode == "from_mel"
                 and cfg.preprocess.extract_mel
             ):
+                t0 = time.perf_counter() if timing is not None else None
                 energy = (mel.exp() ** 2).sum(0).sqrt().cpu().numpy()
+                if timing is not None:
+                    timing["energy"] += time.perf_counter() - t0
             elif cfg.preprocess.energy_extract_mode == "from_waveform":
+                t0 = time.perf_counter() if timing is not None else None
                 energy = audio.energy(wav, cfg.preprocess)
+                if timing is not None:
+                    timing["energy"] += time.perf_counter() - t0
             else:
                 assert cfg.preprocess.energy_extract_mode in [
                     "from_mel",
                     "from_waveform",
                 ], f"{cfg.preprocess.energy_extract_mode} not in supported energy_extract_mode [from_mel, from_waveform, from_tacotron_stft]"
 
-            save_feature(dataset_output, cfg.preprocess.energy_dir, uid, energy)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.energy_dir, uid, energy, timing
+            )
 
         if cfg.preprocess.extract_pitch:
+            t0 = time.perf_counter() if timing is not None else None
             pitch = f0.get_f0(wav, cfg.preprocess)
-            save_feature(dataset_output, cfg.preprocess.pitch_dir, uid, pitch)
+            if timing is not None:
+                timing["pitch"] += time.perf_counter() - t0
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.pitch_dir, uid, pitch, timing
+            )
 
             if cfg.preprocess.extract_uv:
                 assert isinstance(pitch, np.ndarray)
                 uv = pitch != 0
-                save_feature(dataset_output, cfg.preprocess.uv_dir, uid, uv)
+                _save_feature_with_timing(
+                    dataset_output, cfg.preprocess.uv_dir, uid, uv, timing
+                )
 
         if cfg.preprocess.extract_amplitude_phase:
             from utils.mel import amplitude_phase_spectrum
@@ -431,22 +857,41 @@ def extract_utt_acoustic_features_vocoder(dataset_output, cfg, utt):
             log_amplitude, phase, real, imaginary = amplitude_phase_spectrum(
                 wav_torch.unsqueeze(0), cfg.preprocess
             )
-            save_feature(
-                dataset_output, cfg.preprocess.log_amplitude_dir, uid, log_amplitude
+            _save_feature_with_timing(
+                dataset_output,
+                cfg.preprocess.log_amplitude_dir,
+                uid,
+                log_amplitude,
+                timing,
             )
-            save_feature(dataset_output, cfg.preprocess.phase_dir, uid, phase)
-            save_feature(dataset_output, cfg.preprocess.real_dir, uid, real)
-            save_feature(dataset_output, cfg.preprocess.imaginary_dir, uid, imaginary)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.phase_dir, uid, phase, timing
+            )
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.real_dir, uid, real, timing
+            )
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.imaginary_dir, uid, imaginary, timing
+            )
 
         if cfg.preprocess.extract_audio:
-            save_feature(dataset_output, cfg.preprocess.audio_dir, uid, wav)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.audio_dir, uid, wav, timing
+            )
 
         if cfg.preprocess.extract_label:
             if cfg.preprocess.is_mu_law:
                 # compress audio
                 wav = compress(wav, cfg.preprocess.bits)
             label = audio_to_label(wav, cfg.preprocess.bits)
-            save_feature(dataset_output, cfg.preprocess.label_dir, uid, label)
+            _save_feature_with_timing(
+                dataset_output, cfg.preprocess.label_dir, uid, label, timing
+            )
+
+    if timing is not None:
+        timing["total"] = time.perf_counter() - utt_start
+        return timing
+    return None
 
 
 def cal_normalized_mel(mel, dataset_name, cfg):

@@ -47,7 +47,7 @@
       "mert_dir": "mert",
       "spk2id":"spk2id.json",
       "utt2spk":"utt2spk",
-      "valid_file": "test.json",
+      // "valid_file": "test.json",
 
       // Features used for model training
       "use_mel": true,

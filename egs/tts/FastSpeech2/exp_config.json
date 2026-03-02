@@ -6,7 +6,7 @@
   ],
   "dataset_path": {
     // TODO: Fill in your dataset path
-    "LJSpeech": "[LJSpeech dataset path]"
+    "LJSpeech": "/data3/renxiao/codes/Amphion/datasets/LJSpeech-1.1"
   },
   // TODO: Fill in the output log path. The default value is "Amphion/ckpts/tts"
   "log_dir": "ckpts/tts",
