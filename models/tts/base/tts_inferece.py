@@ -176,13 +176,16 @@ class TTSInference(object):
         return str(checkpoint_path)
 
     def inference(self):
+        output_sample_rate = getattr(
+            self, "output_sample_rate", self.cfg.preprocess.sample_rate
+        )
         if self.infer_type == "single":
             out_dir = os.path.join(self.args.output_dir, "single")
             os.makedirs(out_dir, exist_ok=True)
 
             pred_audio = self.inference_for_single_utterance()
             save_path = os.path.join(out_dir, "test_pred.wav")
-            save_audio(save_path, pred_audio, self.cfg.preprocess.sample_rate)
+            save_audio(save_path, pred_audio, output_sample_rate)
 
         elif self.infer_type == "batch":
             out_dir = os.path.join(self.args.output_dir, "batch")
@@ -194,7 +197,7 @@ class TTSInference(object):
                 save_audio(
                     os.path.join(out_dir, f"{uid}.wav"),
                     wav.numpy(),
-                    self.cfg.preprocess.sample_rate,
+                    output_sample_rate,
                     add_silence=True,
                     turn_up=True,
                 )

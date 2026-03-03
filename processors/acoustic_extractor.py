@@ -229,7 +229,7 @@ def extract_utt_acoustic_features_parallel(metadata, dataset_output, cfg, n_work
         n_workers (int, optional): num of processes to extract features in parallel. Defaults to 1.
 
     Returns:
-        list: acoustic features
+        None: acoustic features are saved in dataset_output directory
     """
     num_utts = len(metadata)
     if num_utts == 0:

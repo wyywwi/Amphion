@@ -4,7 +4,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import re
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from collections import OrderedDict
 
@@ -47,19 +49,86 @@ class FastSpeech2Inference(TTSInference):
         return FS2TestDataset, FS2TestCollator
 
     @staticmethod
+    def _extract_checkpoint_step(ckpt_path):
+        stem = Path(ckpt_path).stem
+        if stem.isdigit():
+            return int(stem)
+        match = re.search(r"step-(\d+)", stem)
+        if match is not None:
+            return int(match.group(1))
+        return -1
+
+    @staticmethod
     def _parse_vocoder(vocoder_dir):
         r"""Parse vocoder config"""
         vocoder_dir = os.path.abspath(vocoder_dir)
-        ckpt_list = [ckpt for ckpt in Path(vocoder_dir).glob("*.pt")]
-        # last step (different from the base *int(x.stem)*)
-        ckpt_list.sort(
-            key=lambda x: int(x.stem.split("_")[-2].split("-")[-1]), reverse=True
-        )
-        ckpt_path = str(ckpt_list[0])
         vocoder_cfg = load_config(
             os.path.join(vocoder_dir, "args.json"), lowercase=True
         )
+        ckpt_list = [ckpt for ckpt in Path(vocoder_dir).glob("*.pt")]
+
+        if len(ckpt_list) == 0:
+            raise FileNotFoundError(
+                f"No .pt checkpoint found in vocoder directory: {vocoder_dir}"
+            )
+
+        if vocoder_cfg.model.generator == "bigvgan":
+            # The downloaded BigVGAN checkpoint frome hf are named as pure step numbers
+            ckpt_list.sort(
+                key=lambda x: (
+                    FastSpeech2Inference._extract_checkpoint_step(x),
+                    x.stat().st_mtime,
+                ),
+                reverse=True,
+            )
+        else:
+            # Keep the original FS2 recipe behavior for non-BigVGAN vocoders.
+            # using the FS2 ckpt save name logic, eg. epoch-xxxx_step-yyyy_loss-zzzz.pt, and sort by step number
+            ckpt_list.sort(
+                key=lambda x: int(x.stem.split("_")[-2].split("-")[-1]), reverse=True
+            )
+
+        ckpt_path = str(ckpt_list[0])
         return vocoder_cfg, ckpt_path
+
+    @staticmethod
+    def _prepare_predictions_for_vocoder(pred, target_n_mel):
+        if isinstance(pred, torch.Tensor):
+            if pred.dim() == 3:
+                pred_list = [pred[i] for i in range(pred.shape[0])]
+            elif pred.dim() == 2:
+                pred_list = [pred]
+            else:
+                raise ValueError(f"Unsupported prediction tensor shape: {tuple(pred.shape)}")
+        elif isinstance(pred, list):
+            pred_list = []
+            for item in pred:
+                if isinstance(item, np.ndarray):
+                    item = torch.from_numpy(item)
+                pred_list.append(item)
+        else:
+            raise TypeError(f"Unsupported prediction type: {type(pred)}")
+
+        resized_any = False
+        outputs = []
+        for mel in pred_list:
+            if mel.dim() != 2:
+                raise ValueError(f"Expected 2D mel tensor, but got shape {tuple(mel.shape)}")
+            if mel.shape[-1] != target_n_mel:
+                resized_any = True
+                mel = F.interpolate(
+                    mel.float().unsqueeze(0).unsqueeze(0),
+                    size=(mel.shape[0], target_n_mel),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+            outputs.append(mel.detach().cpu().numpy())
+
+        if resized_any:
+            print(
+                f"[FastSpeech2Inference] Resized predicted mel bins to vocoder n_mel={target_n_mel}."
+            )
+        return outputs
 
     @torch.inference_mode()
     def inference_for_batches(self):
@@ -78,23 +147,28 @@ class FastSpeech2Inference(TTSInference):
                 j += 1
 
         vocoder_cfg, vocoder_ckpt = self._parse_vocoder(self.args.vocoder_dir)
+        self.output_sample_rate = int(vocoder_cfg.preprocess.sample_rate)
+        pred_list = [
+            torch.load(
+                os.path.join(self.args.output_dir, "{}.pt".format(item["Uid"]))
+            ).numpy()
+            for item in self.test_dataset.metadata
+        ]
+        pred_list = self._prepare_predictions_for_vocoder(
+            pred_list, int(vocoder_cfg.preprocess.n_mel)
+        )
         res = synthesis(
             cfg=vocoder_cfg,
             vocoder_weight_file=vocoder_ckpt,
             n_samples=None,
-            pred=[
-                torch.load(
-                    os.path.join(self.args.output_dir, "{}.pt".format(item["Uid"]))
-                ).numpy()
-                for item in self.test_dataset.metadata
-            ],
+            pred=pred_list,
         )
         for it, wav in zip(self.test_dataset.metadata, res):
             uid = it["Uid"]
             save_audio(
                 os.path.join(self.args.output_dir, f"{uid}.wav"),
                 wav.numpy(),
-                self.cfg.preprocess.sample_rate,
+                self.output_sample_rate,
                 add_silence=True,
                 turn_up=True,
             )
@@ -184,6 +258,10 @@ class FastSpeech2Inference(TTSInference):
             )
             pred_res = output["postnet_output"]
             vocoder_cfg, vocoder_ckpt = self._parse_vocoder(self.args.vocoder_dir)
+            self.output_sample_rate = int(vocoder_cfg.preprocess.sample_rate)
+            pred_res = self._prepare_predictions_for_vocoder(
+                pred_res, int(vocoder_cfg.preprocess.n_mel)
+            )
             audio = synthesis(
                 cfg=vocoder_cfg,
                 vocoder_weight_file=vocoder_ckpt,

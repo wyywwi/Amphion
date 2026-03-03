@@ -52,6 +52,9 @@ pretrained/wenet/*conformer_exp
 pretrained/bigvgan/args.json
 !egs/tts/VALLE/prompt_examples/*.wav
 
+pretrained/hifigan_speech/*
+pretrained/bigvgan_singing/*
+
 # Runtime data dirs
 processed_data
 data
